@@ -269,7 +269,6 @@ const STATIC_ASSET_WHITELIST = new Set([
   '/modules/heatmap-switcher.js',
   '/modules/heatmap-state.js',
   '/modules/demo-body-heatmap-simple.js',
-  '/modules/nvidiaVisionClient.js',
   '/modules/translations.js',
   '/locales/am.json'
 ]);
@@ -380,7 +379,11 @@ function setCached(key, data) {
 }
 
 // ===== Ollama (Local, Free) =====
-const OLLAMA_URL = 'http://localhost:11434';
+// Overridable so tests can point it at a dead port. Without that, a developer
+// with Ollama running gets a different fallback chain than CI does: the chain
+// ends at Ollama instead of demo, and the timeout tests fail. Every other
+// provider already reads its endpoint or key from the environment.
+const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
 let ollamaAvailable = false;
 
 async function checkOllama() {
@@ -410,10 +413,18 @@ const openai = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPE
 const groq = process.env.GROQ_API_KEY ? new OpenAI({ apiKey: process.env.GROQ_API_KEY, baseURL: 'https://api.groq.com/openai/v1' }) : null;
 const nvidia = process.env.NVIDIA_API_KEY ? new OpenAI({ apiKey: process.env.NVIDIA_API_KEY, baseURL: 'https://integrate.api.nvidia.com/v1' }) : null;
 
-const { analyzeWithNvidiaVision } = require('./modules/nvidiaVisionClient.js');
+const { describeImage } = require('./modules/geminiVisionClient.js');
 
 // ===== Model Configuration =====
 const MODEL_PRIORITY = ['groq', 'nvidia', 'ollama', 'demo'];
+
+// Model IDs, kept in one place. Every value here was called live on 2026-10-18.
+// The previous IDs (llama-3.3-70b-versatile, gemma-7b-it, and NVIDIA's
+// openai/gpt-oss-120b) are all retired upstream and return model_not_found,
+// model_decommissioned, or HTTP 410. Do not restore them.
+const GROQ_MODEL = 'openai/gpt-oss-120b';
+const NVIDIA_MODEL = 'openai/gpt-oss-20b';
+const GROQ_NEWS_MODEL = 'openai/gpt-oss-20b';
 
 const MODEL_CAPABILITIES = {
   nvidia: { supportsImages: false },
@@ -887,47 +898,42 @@ async function chatWithOllama(prompt) {
   return data.response.trim();
 }
 
-// ===== OpenAI (Tertiary) =====
-async function analyzeWithOpenAI(prompt, imageBase64, imageMimeType) {
-  if (!openai) throw new Error('OpenAI not configured');
-  const userContent = [];
-  if (imageBase64) {
-    userContent.push({
-      type: 'image_url',
-      image_url: { url: `data:${imageMimeType || 'image/jpeg'};base64,${imageBase64}` }
-    });
-  }
-  userContent.push({ type: 'text', text: prompt });
+// ===== Provider timeouts =====
+// Groq answers in ~2s. NVIDIA's surviving text models are reasoning models that
+// need ~13s. Worst case is vision (8s) + Groq (6s) + NVIDIA (20s) = 34s, which
+// must stay under the maxDuration in vercel.json (45s) or the function is
+// edge-killed with a 504 before the chain ever reaches demo mode.
+// tests/ai-model-config.test.js guards that relationship.
+const GROQ_TIMEOUT_MS = 6000;
+const NVIDIA_TIMEOUT_MS = 20000;
 
-  const response = await openai.chat.completions.create({
-    model: 'gpt-4o-mini',
-    temperature: 0.2,
-    max_tokens: 4096,
-    messages: [
-      { role: 'system', content: 'You are a medical AI assistant. Respond ONLY with valid JSON. No markdown formatting, no backticks, no explanations.' },
-      { role: 'user', content: userContent }
-    ]
-  });
-  return extractJSON(response.choices[0].message.content);
-}
+// Shared deadline for news generation. One 20s budget covers both providers, so
+// a slow one cannot run the request past the Vercel maxDuration before the
+// result is saved. This matters more than it looks: the save happens AFTER
+// generation, so an unbounded call means the cache never fills and every
+// request pays the full cost again.
+const NEWS_AI_TIMEOUT_MS = 20000;
+// The news array needs room for the JSON plus the model's reasoning tokens, but
+// 10000 was wasteful. 4000 keeps the reasoning models from returning empty
+// content while cutting generation time.
+const NEWS_MAX_TOKENS = 4000;
 
-// ===== Groq (Secondary) =====
-const AI_PROVIDER_TIMEOUT_MS = 4000;
+// ===== Groq (Primary) =====
 
 async function analyzeWithGroq(prompt) {
   if (!groq) throw new Error('Groq not configured');
   if (process.env.NODE_ENV !== 'production') {
     console.log('Groq Request:', {
-      model: 'llama-3.3-70b-versatile',
+      model: GROQ_MODEL,
       promptLength: prompt?.length
     });
   }
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), AI_PROVIDER_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), GROQ_TIMEOUT_MS);
   try {
     const response = await groq.chat.completions.create({
-      model: 'llama-3.3-70b-versatile',
+      model: GROQ_MODEL,
       temperature: 0.2,
       max_tokens: 4096,
       messages: [
@@ -938,13 +944,13 @@ async function analyzeWithGroq(prompt) {
 
     const responseText = response.choices[0].message.content;
     if (process.env.NODE_ENV !== 'production') {
-      console.log('Groq Response:', { length: responseText.length, model: 'llama-3.3-70b' });
+      console.log('Groq Response:', { length: responseText.length, model: GROQ_MODEL });
     }
     return extractJSON(responseText);
   } catch (error) {
     if (controller.signal.aborted) {
-      console.error('Groq timeout ' + AI_PROVIDER_TIMEOUT_MS + 'ms');
-      throw new Error('Groq timeout after ' + AI_PROVIDER_TIMEOUT_MS + 'ms');
+      console.error('Groq timeout ' + GROQ_TIMEOUT_MS + 'ms');
+      throw new Error('Groq timeout after ' + GROQ_TIMEOUT_MS + 'ms');
     }
     console.error('Groq Error Details:', {
       message: error.message,
@@ -962,16 +968,16 @@ async function analyzeWithNvidia(prompt) {
   if (!nvidia) throw new Error('NVIDIA not configured');
   if (process.env.NODE_ENV !== 'production') {
     console.log('NVIDIA Request:', {
-      model: 'openai/gpt-oss-120b',
+      model: NVIDIA_MODEL,
       promptLength: prompt?.length
     });
   }
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), AI_PROVIDER_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), NVIDIA_TIMEOUT_MS);
   try {
     const response = await nvidia.chat.completions.create({
-      model: 'openai/gpt-oss-120b',
+      model: NVIDIA_MODEL,
       temperature: 0.2,
       max_tokens: 4096,
       messages: [
@@ -982,13 +988,13 @@ async function analyzeWithNvidia(prompt) {
 
     const responseText = response.choices[0].message.content;
     if (process.env.NODE_ENV !== 'production') {
-      console.log('NVIDIA Response:', { length: responseText.length, model: 'nvidia' });
+      console.log('NVIDIA Response:', { length: responseText.length, model: NVIDIA_MODEL });
     }
     return extractJSON(responseText);
   } catch (error) {
     if (controller.signal.aborted) {
-      console.error('NVIDIA timeout ' + AI_PROVIDER_TIMEOUT_MS + 'ms');
-      throw new Error('NVIDIA timeout after ' + AI_PROVIDER_TIMEOUT_MS + 'ms');
+      console.error('NVIDIA timeout ' + NVIDIA_TIMEOUT_MS + 'ms');
+      throw new Error('NVIDIA timeout after ' + NVIDIA_TIMEOUT_MS + 'ms');
     }
     console.error('NVIDIA Error Details:', {
       message: error.message,
@@ -1185,17 +1191,22 @@ app.post('/api/analyze', aiLimiter, async (req, res) => {
     return res.json(translated);
   }
 
-  // Image-only preprocessing using NVIDIA vision
+  // Image preprocessing: describe the photo, then let the text chain reason
+  // over that description. Gemini 2.5 Flash, and exactly one call per upload
+  // because the free tier allows 5 requests per minute.
   let imageDescription = '';
   if (imageBase64) {
     try {
-      const visionRes = await analyzeWithNvidiaVision(prompt, imageBase64);
+      // Pass the patient's own words, not the server's JSON-schema prompt. The
+      // vision model is asked to describe; a "reply with this JSON object" prompt
+      // pushes it to guess a diagnosis instead.
+      const visionRes = await describeImage(symptoms, imageBase64, imageMimeType);
       imageDescription = visionRes.description || '';
-      usedModels.push({ model: 'nvidia_vision', result: visionRes, error: null });
-      console.log('NVIDIA vision description obtained (length: ' + imageDescription.length + ')');
+      usedModels.push({ model: 'gemini_vision', result: visionRes, error: null });
+      console.log('Gemini vision description obtained (length: ' + imageDescription.length + ')');
     } catch (e) {
-      console.error('NVIDIA vision failed:', e.message);
-      usedModels.push({ model: 'nvidia_vision', error: e.message });
+      console.error('Gemini vision failed:', e.message);
+      usedModels.push({ model: 'gemini_vision', error: e.message });
     }
   }
 
@@ -1230,6 +1241,19 @@ app.post('/api/analyze', aiLimiter, async (req, res) => {
   }
 
   prompt = aggregatedPrompt;
+
+  // Whether the chain has any text it can actually reason over. The vision
+  // pre-pass folds the image into imageDescription, so an image-only upload DOES
+  // carry signal and must not be skipped. Gating on the raw `symptoms` field here
+  // is what used to send every photo-only analysis straight to demo mode.
+  const hasTextSignal = Boolean(
+    (symptoms && symptoms.trim()) ||
+    imageDescription ||
+    bodyArea ||
+    (bodyRegions && Array.isArray(bodyRegions) && bodyRegions.length > 0) ||
+    (bodyHeatmapData && typeof bodyHeatmapData === 'object')
+  );
+
   // Do NOT nullify imageBase64. The image description is embedded above, but we
   // keep the raw data so image-capable models can also call their vision endpoints.
 
@@ -1242,13 +1266,11 @@ app.post('/api/analyze', aiLimiter, async (req, res) => {
       continue;
     }
 
-    if (imageBase64 && MODEL_CAPABILITIES[modelName]?.supportsImages === false) {
-      if (!symptoms || !symptoms.trim()) {
-        if (process.env.NODE_ENV !== 'production') {
-          console.log(modelName + ' does not support images and no symptoms text, skipping...');
-        }
-        continue;
+    if (imageBase64 && MODEL_CAPABILITIES[modelName]?.supportsImages === false && !hasTextSignal) {
+      if (process.env.NODE_ENV !== 'production') {
+        console.log(modelName + ' does not support images and nothing describes it, skipping...');
       }
+      continue;
     }
 
     try {
@@ -1355,16 +1377,21 @@ app.post('/api/chat', aiLimiter, verifyToken, requireVerifiedEmail, async (req, 
   if (reply === null && process.env.GROQ_API_KEY && isModelAvailable('groq')) {
     try {
       const response = await groq.chat.completions.create({
-        model: 'llama-3.3-70b-versatile',
+        model: GROQ_MODEL,
         temperature: 0.7,
-        max_tokens: 512,
+        // Reasoning models spend tokens thinking before they write the reply, so
+        // a small budget here yields empty content. Treat empty as a failure so
+        // the chain falls through instead of returning a blank chat bubble.
+        max_tokens: 2048,
         messages: [
           { role: 'system', content: 'You are a helpful medical AI assistant. Be concise and encouraging.' },
           { role: 'user', content: prompt }
         ]
       });
+      const chatText = (response.choices[0].message.content || '').trim();
+      if (!chatText) throw new Error('Groq chat returned empty content');
       incrementModel('groq');
-      reply = response.choices[0].message.content.trim();
+      reply = chatText;
       modelUsed = 'groq';
     } catch (error) {
       console.log('Groq chat failed:', error.message);
@@ -1434,51 +1461,25 @@ Return ONLY valid JSON in this exact format:
   }
 ]`;
 
-    if (nvidia && isModelAvailable('nvidia')) {
-      try {
-        const response = await nvidia.chat.completions.create({
-          model: 'nvidia/nemotron-nano-12b-v2-vl',
-          temperature: 0.7,
-          max_tokens: 10000,
-          messages: [
-            { role: 'system', content: 'You are a health news curator. Respond ONLY with valid JSON array. No markdown, no explanations.' },
-            { role: 'user', content: newsPrompt }
-          ]
-        });
-
-        const responseText = response.choices[0].message.content;
-        const objMatches = responseText.match(/\{[^}]*\}/g) || [];
-        const extracted = objMatches.map(str => {
-          try { return JSON.parse(str); } catch (e) { return null; }
-        }).filter(Boolean);
-        const isValid = Array.isArray(extracted) && extracted.length > 0 && extracted.every(item =>
-          item && typeof item.icon === 'string' && typeof item.tag === 'string' && typeof item.tagName === 'string' && typeof item.date === 'string' && item.title && (typeof item.body === 'string')
-        );
-        if (isValid) {
-          news = extracted;
-          incrementModel('nvidia');
-        } else {
-          console.log('NVIDIA extraction yielded invalid structure, falling back');
-          news = [];
-        }
-      } catch (error) {
-        console.log('NVIDIA news generation failed:', error.message);
-        exhaustModel('nvidia');
-      }
-    }
+    // Groq goes first. It returns this array in a few seconds, while NVIDIA's
+    // gpt-oss-20b needed about 53s for the same array, which exceeds the Vercel
+    // maxDuration before the result can be saved. Both providers share one
+    // deadline so a slow one cannot overrun the request.
+    const newsAbort = new AbortController();
+    const newsTimer = setTimeout(() => newsAbort.abort(), NEWS_AI_TIMEOUT_MS);
 
     if ((!news || news.length === 0) && groq && isModelAvailable('groq')) {
       try {
         const groqResponse = await groq.chat.completions.create({
-          model: 'gemma-7b-it',
+          model: GROQ_NEWS_MODEL,
           temperature: 0.7,
-          max_tokens: 10000,
+          max_tokens: NEWS_MAX_TOKENS,
           messages: [
             { role: 'system', content: 'You are a health news curator. Respond ONLY with valid JSON array. No markdown, no explanations.' },
             { role: 'user', content: newsPrompt }
           ]
-        });
-        const groqText = groqResponse.choices[0].message.content;
+        }, { signal: newsAbort.signal });
+        const groqText = groqResponse.choices[0].message.content || '';
         let groqExtracted = [];
         const startG = groqText.indexOf('[');
         const endG = groqText.lastIndexOf(']');
@@ -1505,9 +1506,52 @@ Return ONLY valid JSON in this exact format:
           news = [];
         }
       } catch (e) {
-        console.log('Groq news generation failed:', e.message);
+        if (newsAbort.signal.aborted) {
+          console.log('Groq news generation timed out after ' + NEWS_AI_TIMEOUT_MS + 'ms');
+        } else {
+          console.log('Groq news generation failed:', e.message);
+        }
       }
     }
+
+    if ((!news || news.length === 0) && nvidia && isModelAvailable('nvidia')) {
+      try {
+        const response = await nvidia.chat.completions.create({
+          model: NVIDIA_MODEL,
+          temperature: 0.7,
+          max_tokens: NEWS_MAX_TOKENS,
+          messages: [
+            { role: 'system', content: 'You are a health news curator. Respond ONLY with valid JSON array. No markdown, no explanations.' },
+            { role: 'user', content: newsPrompt }
+          ]
+        }, { signal: newsAbort.signal });
+
+        // Reasoning models return null content when the token budget runs out.
+        const responseText = response.choices[0].message.content || '';
+        const objMatches = responseText.match(/\{[^}]*\}/g) || [];
+        const extracted = objMatches.map(str => {
+          try { return JSON.parse(str); } catch (e) { return null; }
+        }).filter(Boolean);
+        const isValid = Array.isArray(extracted) && extracted.length > 0 && extracted.every(item =>
+          item && typeof item.icon === 'string' && typeof item.tag === 'string' && typeof item.tagName === 'string' && typeof item.date === 'string' && item.title && (typeof item.body === 'string')
+        );
+        if (isValid) {
+          news = extracted;
+          incrementModel('nvidia');
+        } else {
+          console.log('NVIDIA extraction yielded invalid structure, falling back');
+          news = [];
+        }
+      } catch (error) {
+        if (newsAbort.signal.aborted) {
+          console.log('NVIDIA news generation timed out after ' + NEWS_AI_TIMEOUT_MS + 'ms');
+        } else {
+          console.log('NVIDIA news generation failed:', error.message);
+          exhaustModel('nvidia');
+        }
+      }
+    }
+    clearTimeout(newsTimer);
 
     if (!news || news.length === 0) {
       news = [
@@ -1595,6 +1639,15 @@ app.get('/api/status', (req, res) => {
         dailyLimit: 'unlimited',
         hasKey: ollamaAvailable,
         supportsImages: false
+      },
+      gemini: {
+        // Image analysis only. Not part of MODEL_PRIORITY, so it has no daily
+        // counter here; the free tier is 5 requests per minute.
+        available: !!process.env.GEMINI_API_KEY,
+        usedToday: 0,
+        dailyLimit: 'free tier: 5/min',
+        hasKey: !!process.env.GEMINI_API_KEY,
+        supportsImages: true
       }
     },
     rateLimitResetsAt: new Date(rateLimits.resetTime).toISOString(),
@@ -1654,7 +1707,7 @@ app.get('/', (req, res) => {
     console.log('API Keys configured:');
     console.log('  Groq:', process.env.GROQ_API_KEY ? 'yes' : 'no');
     console.log('  NVIDIA text:', process.env.NVIDIA_API_KEY ? 'yes' : 'no');
-    console.log('  NVIDIA vision (images):', process.env.VISION_API_KEY ? 'yes' : 'no');
+    console.log('  Gemini vision (images):', process.env.GEMINI_API_KEY ? 'yes' : 'no');
     console.log('');
     const rateWindow = process.env.RATE_LIMIT_WINDOW ? parseInt(process.env.RATE_LIMIT_WINDOW) : 1;
     const rateMax = process.env.RATE_LIMIT_MAX ? parseInt(process.env.RATE_LIMIT_MAX) : 20;
@@ -1679,6 +1732,16 @@ app.get('/', (req, res) => {
 
   app.__normalizeAIResponse = normalizeAIResponse;
   app.__extractJSON = extractJSON;
+  // Exposed so tests can read the live model IDs and timeout budgets instead of
+  // restating them. They are locals of this factory, not module scope.
+  app.__modelConfig = {
+    MODEL_PRIORITY,
+    GROQ_MODEL,
+    NVIDIA_MODEL,
+    GROQ_NEWS_MODEL,
+    GROQ_TIMEOUT_MS,
+    NVIDIA_TIMEOUT_MS
+  };
   return app;
 }
 
@@ -1687,3 +1750,7 @@ module.exports = app;
 module.exports.createApp = createApp;
 module.exports.normalizeAIResponse = app.__normalizeAIResponse;
 module.exports.extractJSON = app.__extractJSON;
+// The model config is declared inside createApp(), so it reaches the outside
+// world on `app`, like the two helpers above. Tests read these rather than
+// restating the values and drifting: see tests/ai-model-config.test.js.
+module.exports.modelConfig = app.__modelConfig;

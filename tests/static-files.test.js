@@ -44,7 +44,6 @@ describe('Static file routes (Vercel serverless support)', () => {
       'heatmap-switcher.js',
       'heatmap-state.js',
       'demo-body-heatmap-simple.js',
-      'nvidiaVisionClient.js',
       'translations.js'
     ];
 

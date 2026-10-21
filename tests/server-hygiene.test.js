@@ -57,7 +57,7 @@ describe('Fix 1: modelsAttempted sanitization', () => {
       expect(m).not.toMatch(/upstream|provider|failure|secret|leak/i);
     }
     const set = new Set(entries);
-    const hasProvider = set.has('groq') || set.has('nvidia') || set.has('nvidia_vision');
+    const hasProvider = set.has('groq') || set.has('nvidia') || set.has('gemini_vision');
     expect(hasProvider).toBe(true);
   });
 

@@ -4,7 +4,7 @@
       "src": "Server-v2.js",
       "use": "@vercel/node",
       "config": {
-        "maxDuration": 10,
+        "maxDuration": 45,
         "includeFiles": [
           "timeline.js",
           "hospitals-gondar.json",

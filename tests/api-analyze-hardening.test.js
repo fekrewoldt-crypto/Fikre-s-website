@@ -1,7 +1,8 @@
 // Tests for P1 hardening fixes in /api/analyze:
 //   1. normalizeAIResponse severity/urgency type coercion (no silent downgrade)
 //   2. extractJSON balanced-brace walk (survives prose with stray braces)
-//   3. AbortController + 4s timeout on AI providers (stays under Vercel 10s cap)
+//   3. AbortController + per-provider timeout on AI providers (stays under the
+//      Vercel maxDuration cap)
 
 // Configure env BEFORE requiring Server-v2.js so the groq client is instantiated.
 process.env.NODE_ENV = 'test';
@@ -68,7 +69,10 @@ jest.mock('openai', () => {
 
 require('./setup');
 const request = require('supertest');
-const { createApp, normalizeAIResponse, extractJSON } = require('../Server-v2.js');
+const { createApp, normalizeAIResponse, extractJSON, modelConfig } = require('../Server-v2.js');
+// Read the real budget instead of restating it, so this test cannot drift out of
+// sync with the configured provider timeout.
+const GROQ_TIMEOUT_MS = modelConfig.GROQ_TIMEOUT_MS;
 
 describe('normalizeAIResponse severity type coercion (Bug 1)', () => {
   it('extracts "high" from object form {level:"high"} (not silent downgrade to low)', () => {
@@ -190,8 +194,10 @@ describe('AI provider timeout (Bug 3)', () => {
     process.env.NODE_ENV = savedNodeEnv;
   });
 
-  it('aborts groq call at ~4s when provider hangs and falls back', async () => {
-    global.__aiMockConfig = { delayMs: 10000 }; // 10s > 4s timeout
+  it('aborts the groq call at its configured budget and falls back', async () => {
+    // Hang far past the provider budget so the AbortController, not the
+    // provider, is what ends the call.
+    global.__aiMockConfig = { delayMs: GROQ_TIMEOUT_MS * 4 };
     const uniq = 'timeout-test-' + Date.now();
     const start = Date.now();
     const res = await request(app)
@@ -200,15 +206,19 @@ describe('AI provider timeout (Bug 3)', () => {
     const elapsed = Date.now() - start;
 
     expect(res.status).toBe(200);
-    // 4s timeout + demo fallback should clear in under 5.5s (well under Vercel 10s cap)
-    expect(elapsed).toBeLessThan(5500);
+    // The upper bound is what matters: a worst-case chain has to stay inside
+    // maxDuration in vercel.json or the function is edge-killed with a 504
+    // before it can reach demo mode. tests/ai-model-config.test.js checks the
+    // full budget sum.
+    expect(elapsed).toBeGreaterThanOrEqual(GROQ_TIMEOUT_MS - 500);
+    expect(elapsed).toBeLessThan(GROQ_TIMEOUT_MS + 3000);
 
     expect(Array.isArray(res.body.modelsAttempted)).toBe(true);
     const hadTimeout = res.body.modelsAttempted.some(m =>
       m && m.error && /timeout/i.test(m.error)
     );
     expect(hadTimeout).toBe(true);
-  }, 8000);
+  }, 20000);
 
   it('does not time out when provider responds quickly', async () => {
     global.__aiMockConfig = { delayMs: 50 };
